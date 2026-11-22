@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Solana To-Do dApp (Devnet)</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f1117;
+      color: #f3f4f6;
+      max-width: 720px;
+      margin: 40px auto;
+      padding: 20px;
+      line-height: 1.5;
+    }
+    .card {
+      background: #181b24;
+      border: 1px solid #2a2f3d;
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 18px;
+    }
+    button {
+      background: #7c3aed;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 16px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-right: 8px;
+      margin-top: 8px;
+    }
+    button:hover { background: #6d28d9; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid #374151;
+      background: #11131a;
+      color: white;
+      margin-top: 8px;
+    }
+    code, .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.88rem;
+      word-break: break-all;
+      color: #c4b5fd;
+    }
+    .status {
+      white-space: pre-wrap;
+      background: #11131a;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid #262b38;
+      margin-top: 10px;
+    }
+    a { color: #38bdf8; }
+  </style>
+</head>
+<body>
+  <h1>Solana To-Do dApp</h1>
+  <p>Red: <strong>Devnet</strong> · Program ID: <span class="mono" id="programIdText">3So3vydxxPhLpXvRctidue72oe65fgsLXyk25watyTCU</span></p>
+
+  <div class="card">
+    <h2>1. Wallet (Solflare)</h2>
+    <button id="connectBtn">Conectar Solflare</button>
+    <div class="status" id="walletInfo">Wallet no conectada.</div>
+  </div>
+
+  <div class="card">
+    <h2>2. Perfil de Usuario (UserProfile PDA)</h2>
+    <button id="initProfileBtn" disabled>Inicializar Perfil (initialize_profile)</button>
+    <button id="refreshProfileBtn" disabled>Actualizar Estado del Perfil</button>
+    <div class="status" id="profileInfo">Conecta tu wallet para ver o inicializar tu perfil.</div>
+  </div>
+
+  <div class="card">
+    <h2>3. Crear Tarea (create_task)</h2>
+    <label for="taskTitle">Título de la tarea (máx. 64 caracteres):</label>
+    <input id="taskTitle" type="text" maxlength="64" placeholder="Ej. Completar README final de Solana" />
+    <button id="createTaskBtn" disabled>Crear Tarea en Devnet</button>
+    <div class="status" id="taskLog">Sin transacciones de tarea aún.</div>
+  </div>
+
+  <script type="module">
+    import {
+      Connection,
+      PublicKey,
+      SystemProgram,
+      Transaction,
+      TransactionInstruction
+    } from "https://esm.sh/@solana/web3.js@1.95.3";
+
+    const PROGRAM_ID = new PublicKey("35o3vydxxPhLpXvRctidue72oe6SfgsLXyk2SwmtyTCU");
+    const RPC_URL = "https://api.devnet.solana.com";
+    const connection = new Connection(RPC_URL, "confirmed");
+
+    async function anchorDiscriminator(instructionName) {
+      const data = new TextEncoder().encode(`global:${instructionName}`);
+      const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+      return new Uint8Array(hashBuffer).slice(0, 8);
+    }
+
+    function encodeBorshString(str) {
+      const utf8 = new TextEncoder().encode(str);
+      const out = new Uint8Array(4 + utf8.length);
+      const view = new DataView(out.buffer);
+      view.setUint32(0, utf8.length, true);
+      out.set(utf8, 4);
+      return out;
+    }
+
+    function u64ToLeBytes(valueBigInt) {
+      const buf = new Uint8Array(8);
+      const view = new DataView(buf.buffer);
+      view.setBigUint64(0, BigInt(valueBigInt), true);
+      return buf;
+    }
+
+    function readU64Le(bytes, offset) {
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      return view.getBigUint64(offset, true);
+    }
+
+    function getSolflareProvider() {
+      if (window.solflare && window.solflare.isSolflare) return window.solflare;
+      if (window.solana && window.solana.isSolflare) return window.solana;
+      return null;
+    }
+
+    let walletProvider = null;
+    let authorityPubkey = null;
+
+    const connectBtn = document.getElementById("connectBtn");
+    const walletInfo = document.getElementById("walletInfo");
+    const initProfileBtn = document.getElementById("initProfileBtn");
+    const refreshProfileBtn = document.getElementById("refreshProfileBtn");
+    const profileInfo = document.getElementById("profileInfo");
+    const taskTitleInput = document.getElementById("taskTitle");
+    const createTaskBtn = document.getElementById("createTaskBtn");
+    const taskLog = document.getElementById("taskLog");
+
+    function deriveUserProfilePda(authority) {
+      return PublicKey.findProgramAddressSync(
+        [new TextEncoder().encode("user-profile"), authority.toBytes()],
+        PROGRAM_ID
+      );
+    }
+
+    function deriveTaskPda(authority, taskIdBigInt) {
+      return PublicKey.findProgramAddressSync(
+        [
+          new TextEncoder().encode("task"),
+          authority.toBytes(),
+          u64ToLeBytes(taskIdBigInt)
+        ],
+        PROGRAM_ID
+      );
+    }
+
+    async function refreshProfileState() {
+      if (!authorityPubkey) return;
+      const [userProfilePda] = deriveUserProfilePda(authorityPubkey);
+      const info = await connection.getAccountInfo(userProfilePda, "confirmed");
+
+      if (!info) {
+        profileInfo.innerHTML =
+          `UserProfile PDA: <span class="mono">${userProfilePda.toBase58()}</span>\n` +
+          `Estado: No inicializado todavía.`;
+        initProfileBtn.disabled = false;
+        createTaskBtn.disabled = true;
+        return;
+      }
+
+      const taskCount = info.data.length >= 48 ? readU64Le(info.data, 40) : 0n;
+
+      profileInfo.innerHTML =
+        `UserProfile PDA: <span class="mono">${userProfilePda.toBase58()}</span>\n` +
+        `Estado: Inicializado ✓\n` +
+        `Tareas registradas (task_count): <strong>${taskCount.toString()}</strong>`;
+      initProfileBtn.disabled = true;
+      createTaskBtn.disabled = false;
+    }
+
+    async function signAndSend(ix) {
+      const tx = new Transaction().add(ix);
+      tx.feePayer = authorityPubkey;
+      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+      tx.recentBlockhash = blockhash;
+
+      const signedTx = await walletProvider.signTransaction(tx);
+      const signature = await connection.sendRawTransaction(signedTx.serialize(), {skipPreflight: true });
+      await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed");
+      return signature;
+    }
+
+    connectBtn.addEventListener("click", async () => {
+      const provider = getSolflareProvider();
+      if (!provider) {
+        walletInfo.textContent = "No se detectó Solflare en el navegador. Instala o habilita la extensión de Solflare.";
+        return;
+      }
+
+      try {
+        await provider.connect();
+        walletProvider = provider;
+        authorityPubkey = new PublicKey(provider.publicKey.toString());
+
+        const balanceLamports = await connection.getBalance(authorityPubkey);
+        const balanceSol = (balanceLamports / 1e9).toFixed(4);
+
+        walletInfo.innerHTML =
+          `Conectada: <span class="mono">${authorityPubkey.toBase58()}</span>\n` +
+          `Saldo Devnet: <strong>${balanceSol} SOL</strong>`;
+
+        refreshProfileBtn.disabled = false;
+        await refreshProfileState();
+      } catch (err) {
+        walletInfo.textContent = `Error al conectar Solflare: ${err.message || err}`;
+      }
+    });
+
+    refreshProfileBtn.addEventListener("click", refreshProfileState);
+
+    initProfileBtn.addEventListener("click", async () => {
+      try {
+        initProfileBtn.disabled = true;
+        profileInfo.textContent = "Enviando transacción initialize_profile...";
+
+        const [userProfilePda] = deriveUserProfilePda(authorityPubkey);
+        const disc = await anchorDiscriminator("initialize_profile");
+
+        const ix = new TransactionInstruction({
+          programId: PROGRAM_ID,
+          keys: [
+            { pubkey: userProfilePda, isSigner: false, isWritable: true },
+            { pubkey: authorityPubkey, isSigner: true, isWritable: true },
+            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
+          ],
+          data: disc
+        });
+
+        const sig = await signAndSend(ix);
+        await refreshProfileState();
+        profileInfo.innerHTML +=
+          `\nTx confirmada: <a target="_blank" href="https://explorer.solana.com/tx/${sig}?cluster=devnet">${sig}</a>`;
+      } catch (err) {
+        initProfileBtn.disabled = false;
+        profileInfo.textContent = `Error en initialize_profile: ${err.message || err}`;
+      }
+    });
+
+    createTaskBtn.addEventListener("click", async () => {
+      const title = taskTitleInput.value.trim();
+      if (!title) {
+        taskLog.textContent = "Escribe un título para la tarea antes de enviarla.";
+        return;
+      }
+
+      try {
+        createTaskBtn.disabled = true;
+        taskLog.textContent = "Derivando PDAs y enviando create_task...";
+
+        const [userProfilePda] = deriveUserProfilePda(authorityPubkey);
+        const profileAccountInfo = await connection.getAccountInfo(userProfilePda);
+        if (!profileAccountInfo || profileAccountInfo.data.length < 48) {
+          throw new Error("Primero debes inicializar el perfil.");
+        }
+
+        const nextTaskId = readU64Le(profileAccountInfo.data, 40);
+        const [taskPda] = deriveTaskPda(authorityPubkey, nextTaskId);
+
+        const disc = await anchorDiscriminator("create_task");
+        const titleBytes = encodeBorshString(title);
+        const data = new Uint8Array(disc.length + titleBytes.length);
+        data.set(disc, 0);
+        data.set(titleBytes, disc.length);
+
+        const ix = new TransactionInstruction({
+          programId: PROGRAM_ID,
+          keys: [
+            { pubkey: userProfilePda, isSigner: false, isWritable: true },
+            { pubkey: taskPda, isSigner: false, isWritable: true },
+            { pubkey: authorityPubkey, isSigner: true, isWritable: true },
+            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
+          ],
+          data
+        });
+
+        const sig = await signAndSend(ix);
+        taskTitleInput.value = "";
+        await refreshProfileState();
+
+        taskLog.innerHTML =
+          `¡Tarea creada en Devnet!\n` +
+          `Task PDA: <span class="mono">${taskPda.toBase58()}</span>\n` +
+          `Firma (tx): <a target="_blank" href="https://explorer.solana.com/tx/${sig}?cluster=devnet">${sig}</a>`;
+      } catch (err) {
+        taskLog.textContent = `Error al crear tarea: ${err.message || err}`;
+      } finally {
+        createTaskBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
